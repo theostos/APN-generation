@@ -5,10 +5,75 @@ from functools import cache
 from tqdm import tqdm
 import torch
 
-def add_table(F0, F1, T):
+
+
+def add_table(exponent, device='cpu'):
+    """
+    Loads and returns the addition table for a given exponent from a JSON file.
+
+    Args:
+        exponent (int): Exponent determining which power table to load.
+
+    Returns:
+        torch.Tensor: The loaded power table as a tensor.
+    """
+    with open(f"tables/add_table_{exponent}", "r") as fp:
+        T = json.load(fp)
+    return torch.tensor(T).to(device)
+
+def power_table(exponent, device='cpu'):
+    """
+    Loads and returns the power table for a given exponent from a JSON file.
+
+    Args:
+        exponent (int): Exponent determining which power table to load.
+
+    Returns:
+        torch.Tensor: The loaded power table as a tensor.
+    """
+    with open(f"tables/power_table_{exponent}", "r") as fp:
+        T = json.load(fp)
+    return torch.tensor(T).to(device)
+
+def interpolation_table(exponent, device='cpu'):
+    """
+    Loads and returns the interpolation table for a given exponent from a JSON file.
+
+    Args:
+        exponent (int): Exponent determining which interpolation table to load.
+
+    Returns:
+        torch.Tensor: The loaded interpolation table as a tensor.
+    """
+    with open(f"tables/interpol_table_{exponent}", "r") as fp:
+        T = json.load(fp)
+    return torch.tensor(T).to(device)
+
+def add(F0, F1, T):
+    """
+    Applies a lookup table addition on the given index tensors.
+
+    Args:
+        F0 (torch.Tensor): First index tensor.
+        F1 (torch.Tensor): Second index tensor.
+        T (torch.Tensor): Addition table tensor.
+
+    Returns:
+        torch.Tensor: Tensor resulting from T indexed at F0 and F1.
+    """
     return T[F0[...], F1[...]]
 
 def compute_derivative(F, T):
+    """
+    Computes the derivative of a function represented by a permutation tensor F using the translation table T.
+
+    Args:
+        F (torch.Tensor): Input tensor of shape (batch, field_size) representing functions.
+        T (torch.Tensor): Translation table tensor used for computing derivatives.
+
+    Returns:
+        torch.Tensor: Tensor containing the computed derivative values.
+    """
     # Unpack shapes
     batch, field_size = F.shape
 
@@ -25,7 +90,7 @@ def compute_derivative(F, T):
     F1 = F[:, translated_indices].squeeze(1)
     # .view(batch*field_size, field_size)
     F = F.unsqueeze(1).expand(batch, field_size, field_size)
-    return add_table(F, F1, T)[:,:-1,:]
+    return add(F, F1, T)[:,:-1,:]
 
 def compute_delta_table(DF):
     """
@@ -52,6 +117,76 @@ def compute_delta_table(DF):
     xtmp = torch.bincount (xlab.flatten(), minlength = minl)
     xcnt = xtmp.reshape (xrow, xlim)
     return xcnt
+
+def compute_delta_twisted_table(DF):
+    """
+    Evaluate delta coefficient of a family of functions
+
+    Args:
+        DF (torch.Tensor): Tensor of shape (batch_f, field_size-1, field_size), for each function the lookup table of its derivative.
+    Returns:
+        torch.Tensor: Result of shape (batch_p, batch_input).
+    """
+    batch = DF.size(0)
+    field_size = DF.size(2)
+    # Flatten the first two dimensions
+    flat_DF = DF.reshape(batch, (field_size-1)* field_size)  # Shape: (batch,  (field_size-1)* field_size)
+    # Initialize the max_counts tensor
+    xrow = flat_DF.size(0)
+    xlim = field_size
+    minl = field_size * xrow
+
+    # beware, overflow if xflow*field_size*field_size is greater than max_int
+    assert sqrt(DF.size(0)) < 2**(31/2), "Bincount overflow, please reduce batch size"
+
+    xlab = flat_DF + xlim * torch.arange (xrow, device=DF.device).unsqueeze (1)
+
+    xtmp = torch.bincount(xlab.flatten(), minlength=minl) # (batch, field_size)
+    xcnt = xtmp.reshape (xrow, xlim)
+    return torch.sort(xcnt, dim=-1)[0]
+
+def lexicographical_sort(tensor: torch.Tensor, descending: bool = True) -> torch.Tensor:
+    """
+    Sorts rows of a 2D tensor in lexicographical.
+    
+    Each row is treated as a sequence of digits representing a number in little‐endian order,
+    meaning that the first column is the least significant and the last column the most significant.
+    
+    The sorting is done using an iterative series of stable sorts on each column:
+      - Start with the least significant column (column 0)
+      - Proceed to the next columns, ending with the most significant (last column)
+      
+    Args:
+        tensor (torch.Tensor): A 2D tensor of shape (N, D), where each row is a digit sequence.
+        descending (bool): If True, sorts in descending lexicographical order (i.e. larger
+                           digits come first); otherwise ascending.
+    
+    Returns:
+        torch.Tensor: The input tensor with its rows sorted lexicographically.
+    
+    Note:
+        This solution avoids potential overflow from using large powers.
+        It leverages torch.argsort with the stable option.
+    """
+    # Number of rows and columns (digits)
+    num_rows, num_digits = tensor.shape
+    # Begin with the natural order of row indices.
+    indices = torch.arange(num_rows, device=tensor.device)
+    
+    # Perform a stable sort on each column starting from the least significant (col 0)
+    # up to the most significant (last column).
+    # This is essentially a multi-key sort.
+    for col in range(num_digits-1, -1, -1):
+        # Sorting by column 'col'.
+        # The stable sort ensures that ties (rows with the same digit in this column)
+        # preserve the order established by earlier (less significant) columns.
+        sorted_indices = torch.argsort(
+            tensor[indices, col], descending=descending, stable=True
+        )
+        indices = indices[sorted_indices]
+    
+    # Return the tensor rows sorted by the computed lexicographical order.
+    return tensor[indices].flip(dims=(1,)), indices
 
 def compute_delta_max(DF):
     """
@@ -112,6 +247,23 @@ def compute_delta_spectra(DF):
     values = values.view(DF.size(0), -1)
     return values.max(dim=-1)[0], values.mean(dim=-1), torch.sort(values, dim=-1)[0]
 
+def reduce_evaluate_matrix(M, T):
+    matrix_size = M.size(2)
+    exponent = round(log2(matrix_size),6)
+    # Reduce M to final result using the addition table
+    for step in range(ceil(exponent)):  # Log2(matrix_size) steps
+        stride = 2**step
+        indices = torch.arange(0, matrix_size, 2 * stride, device=M.device)
+        indices_stride = torch.arange(stride, matrix_size, 2 * stride, device=M.device)
+
+        indices = indices[:len(indices_stride)]
+        left = M[..., indices]
+        right = M[..., indices_stride]
+        # Look up addition results in T
+        reduced = T[left, right]
+        M[..., indices] = reduced
+    return M[...,0].clone()
+
 def evaluate_matrix(M, T):
     field_size = T.size(0)
     M_mask = (M == 0)
@@ -129,23 +281,6 @@ def evaluate_all_matrix(M, X, T):
     F_tot = F_part * X
     F_tot[F_mask] = T.size(0) - 1
     return reduce_evaluate_matrix(F_tot, T)
-
-def reduce_evaluate_matrix(M, T):
-    matrix_size = M.size(2)
-    exponent = round(log2(matrix_size),6)
-    # Reduce M to final result using the addition table
-    for step in range(ceil(exponent)):  # Log2(matrix_size) steps
-        stride = 2**step
-        indices = torch.arange(0, matrix_size, 2 * stride, device=M.device)
-        indices_stride = torch.arange(stride, matrix_size, 2 * stride, device=M.device)
-
-        indices = indices[:len(indices_stride)]
-        left = M[..., indices]
-        right = M[..., indices_stride]
-        # Look up addition results in T
-        reduced = T[left, right]
-        M[..., indices] = reduced  #
-    return M[...,0].clone()
 
 def evaluate_polynomials(P, X, T):
     """
@@ -187,30 +322,46 @@ def evaluate_polynomials(P, X, T):
     # # Final reduction gives shape (batch_p, batch_input)
     return R[..., 0].clone()
 
-@cache
-def power_table(exponent):
-    with open(f"power_table_{exponent}", "r") as fp:
-        T = json.load(fp)
-    T = torch.tensor(T)
-    return T
+def interpolate_function(F, T, I):
+    """
+    Interpolates a function F over a finite field using the given addition table T.
 
-@cache
-def interpol_table(exponent):
-    with open(f"interpol_table_{exponent}", "r") as fp:
-        T = json.load(fp)
-    T = torch.tensor(T)
-    return T
+    Args:
+        F (torch.Tensor): Function tensor to interpolate.
+        T (torch.Tensor): Addition table tensor.
+        I (torch.Tensor): Interpolation table tensor.
 
-def interpolate_function(F, T):
-    field_size = T.size(0)
-    exponent = int(round(log2(field_size),6))
-    X = interpol_table(exponent).to(F.device)
-    return evaluate_polynomials(F, X, T)
+    Returns:
+        torch.Tensor: Interpolated function evaluation.
+    """
+    return evaluate_polynomials(F, I, T)
 
 def generate_batch_perm(batch, size):
+    """
+    Generates a batch of permutation indices.
+
+    Args:
+        batch (int): Number of permutations to generate.
+        size (int): Size of each permutation.
+
+    Returns:
+        torch.Tensor: Tensor of shape (batch, size) containing permutation indices.
+    """
     return torch.rand(batch, size).argsort (dim = 1)
 
 def draw_sparse_polynomials(field_size, num_coef, num_ech, device='cpu'):
+    """
+    Draws sparse polynomials by randomly selecting coefficients.
+
+    Args:
+        field_size (int): Size of the finite field.
+        num_coef (int): Number of non-zero coefficients.
+        num_ech (int): Number of polynomial examples to generate.
+        device (str, optional): The device to perform computations on. Defaults to 'cpu'.
+
+    Returns:
+        torch.Tensor: Tensor representing the generated sparse polynomials.
+    """
     # Beware, NOT a permutation
     poly = torch.randint(0, field_size-1, (num_ech, field_size), device=device)
 
@@ -222,15 +373,43 @@ def draw_sparse_polynomials(field_size, num_coef, num_ech, device='cpu'):
 
 
 def get_filter_function_delta(F, deltas, treshold):
+    """
+    Filters functions based on their delta coefficients.
+    """
     return F[deltas <= treshold]
 
 def score_functions(F, T):
+    """
+    Computes the maximum and mean delta coefficients of functions F using the addition table T.
+
+    Args:
+        F (torch.Tensor): Tensor of functions.
+        T (torch.Tensor): Addition table tensor.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Tuple containing maximum and mean delta coefficients.
+    """
     DF = compute_derivative(F, T)
     deltas_max = compute_delta_max(DF)
     deltas_mean = compute_delta_mean(DF)
     return deltas_max, deltas_mean
 
 def generate_functions(T, target_gen, export=None, device='cpu', threshold=6, exponent=6, batch_p=5_000):
+    """
+    Generates a specified number of functions that meet a threshold criteria based on their delta mean coefficients.
+
+    Args:
+        T (torch.Tensor): Addition table tensor.
+        target_gen (int): Target number of functions to generate.
+        export (str, optional): File path to export functions. Defaults to None.
+        device (str, optional): Device for computation. Defaults to 'cpu'.
+        threshold (float, optional): Delta mean threshold for filtering functions. Defaults to 6.
+        exponent (int, optional): Exponent to determine field size (field_size = 2**exponent). Defaults to 6.
+        batch_p (int, optional): Batch size of functions per iteration. Defaults to 5_000.
+
+    Returns:
+        torch.Tensor: Tensor containing the generated functions that meet the threshold.
+    """
     batch_p = 5_000
     field_size = 2**exponent
     current_num = 0
@@ -255,6 +434,18 @@ def generate_functions(T, target_gen, export=None, device='cpu', threshold=6, ex
     return output
 
 def generate_random_permutations_vectorized(size, num_samples, max_k, device='cpu'):
+    """
+    Generates random permutations (vectorized).
+
+    Args:
+        size (int): The size of each permutation.
+        num_samples (int): Number of permutations to generate.
+        max_k (int): Maximum number of elements to permute in each sample.
+        device (str, optional): Device on which to perform computations. Defaults to 'cpu'.
+
+    Returns:
+        torch.Tensor: Tensor of shape (num_samples, size) containing random permutations.
+    """
     # Step 1: Create a base identity permutation of shape (num_samples, size)
     random_perms = torch.arange(size, device=device).repeat(num_samples, 1)  # Shape: (num_samples, size)
 
@@ -283,12 +474,28 @@ def generate_random_permutations_vectorized(size, num_samples, max_k, device='cp
     return random_perms
 
 def compute_pre_compositions(permutation, random_permutations):
-    # Compute pre-composition of `permutation` with each random permutation
-    # permutation: shape (1, size)
-    # random_permutations: shape (num_samples, size)
+    """
+    Computes the pre-composition of a fixed permutation with each permutation in a batch of random permutations.
+
+    Args:
+        permutation (torch.Tensor): Tensor of shape (1, size) representing the fixed permutation.
+        random_permutations (torch.Tensor): Tensor of shape (num_samples, size) representing random permutations.
+
+    Returns:
+        torch.Tensor: Tensor of pre-composed permutations.
+    """
     return random_permutations[:, permutation[0]]
 
 def generate_composed_permutations(permutation):
+    """
+    Generates composed permutations by computing all transpositions of the given permutation and concatenating them with the original.
+
+    Args:
+        permutation (torch.Tensor): Tensor of shape (1, size) representing the original permutation.
+
+    Returns:
+        torch.Tensor: Tensor containing the original permutation and all composed transpositions.
+    """
     size = permutation.shape[1]
     
     # Generate all pairs of indices for transpositions (i, j) where i < j
@@ -309,6 +516,16 @@ def generate_composed_permutations(permutation):
     return torch.cat([permutation, swapped_permutations])
 
 def local_improvement(T, F):
+    """
+    Performs local improvement on a function F by iteratively generating composed permutations to minimize its delta coefficient.
+
+    Args:
+        T (torch.Tensor): Addition table tensor.
+        F (torch.Tensor): Tensor representing the function to improve.
+
+    Returns:
+        Tuple[torch.Tensor, float]: A tuple containing the improved function and its new delta value.
+    """
     old_delta = T.size(0) + 1
     new_delta = T.size(0)
     while new_delta < old_delta:
@@ -324,6 +541,17 @@ def local_improvement(T, F):
     return F, new_delta
 
 def improve_top_k(F, T, k=10):
+    """
+    Improves functions by generating composed permutations and selecting the top-k functions with the lowest delta coefficients.
+
+    Args:
+        F (torch.Tensor): Tensor of functions.
+        T (torch.Tensor): Addition table tensor.
+        k (int, optional): The number of top functions to select. Defaults to 10.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: A tuple containing the top-k improved functions and their corresponding delta values.
+    """
     all_values, all_functions = [], []
     for ex in F:
         ex = ex.unsqueeze(0)
@@ -342,11 +570,33 @@ def improve_top_k(F, T, k=10):
     return all_functions[indices,:].clone(), -values
 
 def improve_beam(F,T, n_iter, k=10):
+    """
+    Performs beam search improvement on a set of functions over several iterations.
+
+    Args:
+        F (torch.Tensor): Tensor of functions.
+        T (torch.Tensor): Addition table tensor.
+        n_iter (int): Number of iterations to perform improvement.
+        k (int, optional): Number of top candidates to select in each iteration. Defaults to 10.
+
+    Returns:
+        Tuple[torch.Tensor, float]: A tuple containing the best improved function and its delta value.
+    """
     for _ in range(n_iter):
         F, delta = improve_top_k(F,T,k=k)
     return F[0,...].unsqueeze(0).clone(), delta[0]
 
 def improve_score_functions(F, T):
+    """
+    Improves score functions by applying local improvement on each function in F to reduce the delta coefficient.
+
+    Args:
+        F (torch.Tensor): Tensor of functions.
+        T (torch.Tensor): Addition table tensor.
+
+    Returns:
+        torch.Tensor: Tensor containing the delta values after improvement for each function.
+    """
     deltas = []
     for ex in F:
         ex = ex.unsqueeze(0)
@@ -357,6 +607,16 @@ def improve_score_functions(F, T):
     return torch.tensor(deltas)
 
 def improve_beam_score_functions(F,T):
+    """
+    Evaluates functions using beam search improvement to score and produce improved functions' delta coefficients.
+
+    Args:
+        F (torch.Tensor): Tensor of functions.
+        T (torch.Tensor): Addition table tensor.
+
+    Returns:
+        torch.Tensor: Tensor containing delta coefficients after beam search improvement.
+    """
     deltas = []
     for ex in tqdm(F):
         ex = ex.unsqueeze(0)
@@ -366,6 +626,16 @@ def improve_beam_score_functions(F,T):
     return torch.tensor(deltas)
 
 def random_p2(batch, T):
+    """
+    Generates a random tensor with a specific structure based on the field size provided by T.
+
+    Args:
+        batch (int): Number of samples to generate.
+        T (torch.Tensor): Addition table tensor.
+
+    Returns:
+        torch.Tensor: Generated tensor with manipulated random indices.
+    """
     field_size = T.size(0)
     P = torch.ones(batch, field_size, dtype=torch.long)*field_size
     random_idx = torch.randint(1,field_size, (batch,))
@@ -377,12 +647,32 @@ def random_p2(batch, T):
     return P
 
 def generate_gl_2_matrix(size, batch_size=1_000_000, device='cpu'):
+    """
+    Generates a batch of random matrices in GL(2).
+
+    Args:
+        size (int): Size of the matrix (number of rows/columns).
+        batch_size (int, optional): Number of matrices to generate. Defaults to 1_000_000.
+        device (str, optional): Device on which to perform computations. Defaults to 'cpu'.
+
+    Returns:
+        torch.Tensor: Tensor containing invertible matrices over GF(2).
+    """
     mat = torch.randint(0, 2, (batch_size, size,size), device=device)
     det = torch.linalg.det(mat.float())
     idx_inv = (det%2)==1
     return mat[idx_inv,:]
 
 def generate_all_bit_function(num_bit):
+    """
+    Recursively generates all bit functions of a given bit length.
+
+    Args:
+        num_bit (int): Number of bits.
+
+    Returns:
+        list: A list of bit functions, where each function is represented as a list of integers.
+    """
     if num_bit <= 0:
         return []
     elif num_bit == 1:
@@ -396,6 +686,15 @@ def generate_all_bit_function(num_bit):
         return all_functions
 
 def generate_basis(T):
+    """
+    Generates a basis using bit functions and evaluates them using the addition table T.
+
+    Args:
+        T (torch.Tensor): Addition table tensor.
+
+    Returns:
+        torch.Tensor: Basis matrix generated and sorted based on evaluated results.
+    """
     field_size = T.size(0)
     exponent = round(log2(field_size),6)
 
@@ -405,6 +704,18 @@ def generate_basis(T):
     return M[0, indices,...]
 
 def generate_linear_polynomial(exponent, T, num_f, batch_size=10_000):
+    """
+    Generates linear polynomial functions.
+
+    Args:
+        exponent (int): Exponent to determine field size (field_size = 2**exponent).
+        T (torch.Tensor): Addition table tensor.
+        num_f (int): Number of functions to generate.
+        batch_size (int, optional): Batch size for generating matrices. Defaults to 10_000.
+
+    Returns:
+        torch.Tensor: Tensor containing generated linear polynomial functions.
+    """
     M_basis = generate_basis(T)
     count = 0
     M_out = []
@@ -418,6 +729,16 @@ def generate_linear_polynomial(exponent, T, num_f, batch_size=10_000):
     return M_out_t[:num_f,:]
 
 def precompose(A, B):
+    """
+    Precomposes two sets of functions (lookup table).
+
+    Args:
+        A (torch.Tensor): First lookup table.
+        B (torch.Tensor): Second lookup table.
+
+    Returns:
+        torch.Tensor: Resultant tensor after pre-composition.
+    """
     batch_size, n = A.shape
     # Expand B to get the indices for each batch
     batch_indices = torch.arange(batch_size).unsqueeze(1).expand(-1, n)
@@ -425,6 +746,15 @@ def precompose(A, B):
     return A[batch_indices, B]
 
 def check_if_permutation(F):
+    """
+    Checks whether each row in the tensor F is a valid permutation.
+
+    Args:
+        F (torch.Tensor): Tensor with each row representing a permutation.
+
+    Returns:
+        torch.Tensor: Boolean tensor indicating if each row is a valid permutation.
+    """
     F_sort, _ = torch.sort(F)
     field_size = F.size(1)
     return torch.all(F_sort == torch.arange(0, field_size, device=F.device), dim=1)

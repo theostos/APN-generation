@@ -1,76 +1,141 @@
-import json
+import argparse
+import random
 
 from tqdm import tqdm
-import torch
 
 from src.apn.apn import *
 
 
-if __name__ == "__main__":
-    import random
-    import argparse
+def local_search_delta_mean(P, X, T, max_steps=32, batch_perturbation=2_000):
+    F = evaluate_polynomials(P, X, T)
+    DF = compute_derivative(F, T)
+    
+    _, delta_mean, _ = compute_delta_spectra(DF)
+    delta_mean_temp = delta_mean[0]
+    print(delta_mean_temp)
+    acc = 0
+    while True:
+        k = random.randint(0, 63)
+        P_eps = torch.randint(0, 2, (batch_perturbation, 64), device=device)
+        P_new_eps = torch.where(P_eps==1, k, 63)
 
+        F_eps = evaluate_polynomials(P_new_eps, X, T)
+        F_perturbate = add(F, F_eps, T)
+
+        DF = compute_derivative(F_perturbate, T)
+        _, delta_mean, _ = compute_delta_spectra(DF)
+        idx_delta_mean = torch.argmin(delta_mean)
+        if delta_mean[idx_delta_mean] < delta_mean_temp:
+            delta_mean_temp = delta_mean[idx_delta_mean]
+            F = F_perturbate[idx_delta_mean,:].unsqueeze(0)
+            print(delta_mean_temp)
+            acc = 0
+        else:
+            acc += 1
+        
+        if acc > max_steps:
+            return F, delta_mean_temp
+
+
+def local_search_spectrum(P, X, T, max_steps=100, batch_perturbation=1_000):
+    target = torch.zeros(T.size(0))
+    target[-1] = 2016
+    target[-2] = 2016
+
+    F = evaluate_polynomials(P, X, T)
+    DF = compute_derivative(F, T)
+    delta_table = compute_delta_table(DF).reshape(1, 63, 64)
+    twisted_delta = compute_delta_twisted_table(delta_table)
+    distance_old = (torch.sqrt((twisted_delta - target)**2)).sum(dim=1)[0]
+    print(distance_old)
+    acc = 0
+    while True:
+        # k = random.randint(0, 62)
+        # F_eps = torch.randint(0, 2, (batch_perturbation, 64), device=device)
+        # F_new_eps = torch.where(F_eps==1, k, 63)
+        
+        F_new_eps = draw_sparse_polynomials(64, 1, batch_perturbation, device=device)
+        F_perturbate = add(F, F_new_eps, T)
+        DF = compute_derivative(F_perturbate, T)
+        
+        delta_table = compute_delta_table(DF).reshape(batch_perturbation, 63, 64)
+        twisted_delta = compute_delta_twisted_table(delta_table)
+        distances = (torch.sqrt((twisted_delta - target)**2)).sum(dim=1)
+        indice = torch.argmin(distances)
+        if distances[indice] < distance_old:
+            F = F_perturbate[indice,:].unsqueeze(0)
+            distance_old = distances[indice]
+            print(distance_old)
+            acc = 0
+        else:
+            acc += 1
+        
+        if acc > max_steps:
+            return F, distance_old
+
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--num-device', default=1, help='GPU index')
+    parser.add_argument('--device', default='cpu')
     parse = parser.parse_args()
+
     exponent=6
     field_size = 2**exponent
-    num_device = parse.num_device
-    device = f'cuda:{num_device}'
-    with open(f"power_table_{exponent}", "r") as fp:
-        X = json.load(fp)
-    X = torch.tensor(X).to(device)
-    with open(f"add_table_{exponent}", "r") as fp:
-        T = json.load(fp)
-    T = torch.tensor(T).to(device)
-
     num_gen = 100_000
-    for sub in range(8, 100):
-        progress_bar = tqdm(total=num_gen)
-        total_size = 0
-        list_P = []
-        while total_size < num_gen:
-            k = random.randint(3,6)
 
-            P = torch.load('export_sparse_NONperm_1_8_deg3_4_0.pt').to(device)
-            P = P[0,:].unsqueeze(0)
-            F = evaluate_polynomials(P, X, T)
-            DF = compute_derivative(F, T)
+    device = parse.device
+    T = add_table(exponent, device=device)
+    X = power_table(exponent, device=device)
+    
 
-            spectrum_set = set()
-            delta_max_or, delta_mean_or, spectrum_or = compute_delta_spectra(DF)
-            print(delta_mean_or, delta_max_or)
-            spectrum_set.add(str(spectrum_or[0,:].tolist()))
-            while True:
-                for k in range(63):
-                    eps = torch.randint(0, 2, (40_000, 64), device=device)
-                    new_eps = torch.where(eps==1, k, 63)
+    progress_bar = tqdm(total=num_gen)
+    total_size = 0
+    list_P = []
+    while total_size < num_gen:
+        P = draw_sparse_polynomials(field_size, 16, 1, device=device)
+        local_search_spectrum(P, X, T)
+        # for k in range(63):
+        #     eps = torch.randint(0, 2, (40_000, 64), device=device)
+        #     new_eps = torch.where(eps==1, k, 63)
+        #     new_eps = evaluate_polynomials(new_eps, X, T)
 
-                    F_perturbate = add_table(F, new_eps, T)
-                    DF = compute_derivative(F_perturbate, T)
-                    delta_max, delta_mean, spectrum = compute_delta_spectra(DF)
+        #     F_perturbate = add(F, new_eps, T)
 
-                    idx_delta_mean = torch.argmin(delta_mean)
+        #     DF = compute_derivative(F_perturbate, T)
+        #     twisted_delta = compute_delta_twisted_table(DF)//2
+        #     delta_max, delta_mean, spectrum = compute_delta_spectra(DF)
+        #     candidates, indices = lexicographical_sort(twisted_delta)
+        exit()
+            # spectrum_set.add(str(spectrum_or[0,:].tolist()))
+            # while True:
+            #     for k in range(63):
+            #         eps = torch.randint(0, 2, (40_000, 64), device=device)
+            #         new_eps = torch.where(eps==1, k, 63)
+
+            #         F_perturbate = add_table(F, new_eps, T)
+            #         DF = compute_derivative(F_perturbate, T)
+            #         delta_max, delta_mean, spectrum = compute_delta_spectra(DF)
+
+            #         idx_delta_mean = torch.argmin(delta_mean)
                     
-                    if torch.min(delta_mean) <= delta_mean_or:
-                        delta_max = delta_max[idx_delta_mean]
-                        delta_mean = delta_mean[idx_delta_mean]
-                        F = F_perturbate[idx_delta_mean,:].unsqueeze(0)
+            #         if torch.min(delta_mean) <= delta_mean_or:
+            #             delta_max = delta_max[idx_delta_mean]
+            #             delta_mean = delta_mean[idx_delta_mean]
+            #             F = F_perturbate[idx_delta_mean,:].unsqueeze(0)
 
-                        opt_perturbate = new_eps[idx_delta_mean,:].unsqueeze(0)
-                        eps_pol = interpolate_function(opt_perturbate, T)
-                        degrees = compute_degrees(eps_pol, 6)
-                        poly = ""
-                        for deg, coef in enumerate(eps_pol[0,:].tolist()):
-                            if coef != 63:
-                                poly += f"\\alpha^{coef} X^{deg} +"
-                        poly = poly[:-2]
-                        print(poly)
-                        print(degrees.item(), delta_mean.item(), delta_max.item())
-                        spectrum = spectrum[idx_delta_mean, :]
-                        hash_sp = str(spectrum.tolist())
-                        if hash_sp in spectrum_set:
-                            print("ALED")
-                        else:
-                            spectrum_set.add(hash_sp)
-                        delta_mean_or = delta_mean
+            #             opt_perturbate = new_eps[idx_delta_mean,:].unsqueeze(0)
+            #             eps_pol = interpolate_function(opt_perturbate, T)
+            #             degrees = compute_degrees(eps_pol, 6)
+            #             poly = ""
+            #             for deg, coef in enumerate(eps_pol[0,:].tolist()):
+            #                 if coef != 63:
+            #                     poly += f"\\alpha^{coef} X^{deg} +"
+            #             poly = poly[:-2]
+            #             print(poly)
+            #             print(degrees.item(), delta_mean.item(), delta_max.item())
+            #             spectrum = spectrum[idx_delta_mean, :]
+            #             hash_sp = str(spectrum.tolist())
+            #             if hash_sp in spectrum_set:
+            #                 print("ALED")
+            #             else:
+            #                 spectrum_set.add(hash_sp)
+            #             delta_mean_or = delta_mean
