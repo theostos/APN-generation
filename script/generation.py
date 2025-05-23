@@ -12,7 +12,6 @@ def local_search_delta_mean(P, X, T, max_steps=32, batch_perturbation=2_000):
     
     _, delta_mean, _ = compute_delta_spectra(DF)
     delta_mean_temp = delta_mean[0]
-    print(delta_mean_temp)
     acc = 0
     while True:
         k = random.randint(0, 63)
@@ -28,7 +27,6 @@ def local_search_delta_mean(P, X, T, max_steps=32, batch_perturbation=2_000):
         if delta_mean[idx_delta_mean] < delta_mean_temp:
             delta_mean_temp = delta_mean[idx_delta_mean]
             F = F_perturbate[idx_delta_mean,:].unsqueeze(0)
-            print(delta_mean_temp)
             acc = 0
         else:
             acc += 1
@@ -36,9 +34,14 @@ def local_search_delta_mean(P, X, T, max_steps=32, batch_perturbation=2_000):
         if acc > max_steps:
             return F, delta_mean_temp
 
+def step_fun(acc, max_steps):
+    if acc < int(max_steps*0.8):
+        return 1
+    dist = int(32*(acc-max_steps*0.8)/(0.2*max_steps))
+    return dist
 
-def local_search_spectrum(P, X, T, max_steps=100, batch_perturbation=1_000):
-    target = torch.zeros(T.size(0))
+def local_search_spectrum(P, X, T, max_steps=20, batch_perturbation=1_000):
+    target = torch.zeros(T.size(0), device=P.device)
     target[-1] = 2016
     target[-2] = 2016
 
@@ -47,25 +50,21 @@ def local_search_spectrum(P, X, T, max_steps=100, batch_perturbation=1_000):
     delta_table = compute_delta_table(DF).reshape(1, 63, 64)
     twisted_delta = compute_delta_twisted_table(delta_table)
     distance_old = (torch.sqrt((twisted_delta - target)**2)).sum(dim=1)[0]
-    print(distance_old)
     acc = 0
     while True:
-        # k = random.randint(0, 62)
-        # F_eps = torch.randint(0, 2, (batch_perturbation, 64), device=device)
-        # F_new_eps = torch.where(F_eps==1, k, 63)
-        
-        F_new_eps = draw_sparse_polynomials(64, 1, batch_perturbation, device=device)
+        k = step_fun(acc, max_steps)
+        F_new_eps = draw_sparse_polynomials(64, k, batch_perturbation, device=device)
         F_perturbate = add(F, F_new_eps, T)
+            
         DF = compute_derivative(F_perturbate, T)
         
-        delta_table = compute_delta_table(DF).reshape(batch_perturbation, 63, 64)
+        delta_table = compute_delta_table(DF).reshape(F_perturbate.size(0), 63, 64)
         twisted_delta = compute_delta_twisted_table(delta_table)
         distances = (torch.sqrt((twisted_delta - target)**2)).sum(dim=1)
         indice = torch.argmin(distances)
         if distances[indice] < distance_old:
             F = F_perturbate[indice,:].unsqueeze(0)
             distance_old = distances[indice]
-            print(distance_old)
             acc = 0
         else:
             acc += 1
@@ -80,19 +79,33 @@ if __name__ == "__main__":
 
     exponent=6
     field_size = 2**exponent
-    num_gen = 100_000
+    num_gen = 700_000
 
     device = parse.device
     T = add_table(exponent, device=device)
     X = power_table(exponent, device=device)
-    
+    I = interpolation_table(exponent, device=device)
 
     progress_bar = tqdm(total=num_gen)
     total_size = 0
     list_P = []
-    while total_size < num_gen:
-        P = draw_sparse_polynomials(field_size, 16, 1, device=device)
-        local_search_spectrum(P, X, T)
+    min_distance = float('inf')
+    for k in tqdm(range(num_gen)):
+        P = draw_sparse_polynomials(field_size, 63, 1, device=device)
+        # F,_ = local_search_delta_mean(P, X, T)
+        # P = interpolate_function(F, T, I)
+        F , distance = local_search_spectrum(P, X, T)
+        P = interpolate_function(F, T, I)
+        list_P.append(P.unsqueeze(0).to('cpu'))
+
+        if len(list_P) % 50_000 == 0:
+            torch.save(torch.cat(list_P, dim=0), f'training_{device}_{k}.pt')
+            list_P = []
+    torch.save(torch.cat(list_P, dim=0), f'training_{device}_final.pt')
+        # # print(distance)
+        # if distance < min_distance:
+        #     min_distance = distance
+        #     print(distance)
         # for k in range(63):
         #     eps = torch.randint(0, 2, (40_000, 64), device=device)
         #     new_eps = torch.where(eps==1, k, 63)
@@ -104,7 +117,6 @@ if __name__ == "__main__":
         #     twisted_delta = compute_delta_twisted_table(DF)//2
         #     delta_max, delta_mean, spectrum = compute_delta_spectra(DF)
         #     candidates, indices = lexicographical_sort(twisted_delta)
-        exit()
             # spectrum_set.add(str(spectrum_or[0,:].tolist()))
             # while True:
             #     for k in range(63):
