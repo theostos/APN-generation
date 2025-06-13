@@ -1,9 +1,11 @@
 from math import sqrt, log2, ceil
 import json
 from functools import cache
+import random
 
 from tqdm import tqdm
 import torch
+from torch import Tensor
 
 
 
@@ -49,7 +51,7 @@ def interpolation_table(exponent, device='cpu'):
         T = json.load(fp)
     return torch.tensor(T).to(device)
 
-def add(F0, F1, T):
+def add(F0:Tensor, F1:Tensor, T:Tensor):
     """
     Applies a lookup table addition on the given index tensors.
 
@@ -91,6 +93,105 @@ def compute_derivative(F, T):
     # .view(batch*field_size, field_size)
     F = F.unsqueeze(1).expand(batch, field_size, field_size)
     return add(F, F1, T)[:,:-1,:]
+
+def compute_trace_table(exponent, device='cpu'):
+    """
+    Compute the trace table for a given exponent.
+
+    Args:
+        exponent (int): Exponent determining which power table to load.
+
+    Returns:
+        torch.Tensor: The loaded power table as a tensor.
+    """
+    pow_t = power_table(exponent, device=device)
+    add_t = add_table(exponent, device=device)
+
+    result = ((2**exponent -1) * torch.ones(2**exponent)).int()
+    pow_seq = 2**(torch.arange(0, exponent, device=device))
+    for pow in pow_seq:
+        result = add(result, pow_t[:, pow], add_t)
+    result[result==0] = -1
+    result[result==63] = 1
+    return result.to(device=device)
+
+def compute_walsh_optimal(DF: Tensor, trace_table: Tensor) -> Tensor:
+    """
+    Compute the squared sum of Walsh coefficients for each derivative.
+
+    Args:
+        DF: (batch, field_size-1, field_size)
+        trace_table: (field_size, ) lookup table for (-1)^{Tr(x)}
+    Returns:
+        result: (batch, num_a) sum_b W_{D_a F}(0, b)^2
+    """
+    B, A, M = DF.shape
+    m       = M - 1                # = 2^n - 1
+
+    # 1) expand DF over an extra "shift" axis:
+    #    F_exp[b,a,shift,x] = DF[b,a,x]
+    F_exp   = DF.unsqueeze(2).expand(B, A, M, M)
+
+    # 2) build the "b" axis in the same shape:
+    shifts  = torch.arange(M, device=DF.device)
+    shifts  = shifts.view(1, 1, M, 1).expand(B, A, M, M)
+
+    # 3) exponent-add mod (2^n−1), then mask any zero-factor cases
+    prod    = (F_exp + shifts) % m
+    zero_m  = (F_exp == m) | (shifts == m)
+    prod[zero_m] = m
+
+    # 4) lookup (−1)^Tr(...) for every (b,a,x):
+    signs   = trace_table[prod]        # shape (B, A, M, M)
+
+    # 5) sum over x (dim=3) to get W(b) for each a:
+    W       = signs.sum(dim=3)       # shape (B, A, M)
+
+    # 6) square and sum over b (dim=2):
+    return (W**2).sum(dim=2)
+
+def compute_walsh_loss(F, T, trace_table):
+    DF = compute_derivative(F, T)
+    walsh_opt = compute_walsh_optimal(DF, trace_table)
+    target = 2*F.size(1)**2 * torch.ones_like(walsh_opt)
+    norm = torch.norm((walsh_opt - target).float(), p=2, dim=1)
+    return norm
+
+def gradient_walsh(F, T, trace_table):
+    batch_size, field_size = F.shape
+    F_exp = F.unsqueeze(1).expand(batch_size, field_size, field_size)
+    F_exp = F_exp.reshape(batch_size*field_size, field_size)
+    # ones = torch.eye(field_size, field_size, dtype=torch.long, device=T.device) # \alpha^0 = 1
+    ones = torch.diag(torch.randint(0, field_size-1, (field_size,), device=T.device)) # \alpha^0 = 1
+    ones = ones.unsqueeze(0).expand(batch_size, field_size, field_size)
+    ones = ones.reshape(batch_size*field_size, field_size)
+    F_translate = add(F_exp, ones, T)
+
+    DF = compute_derivative(F_translate, T)
+    walsh_opt = compute_walsh_optimal(DF, trace_table)
+    target = 2*field_size**2 * torch.ones_like(walsh_opt)
+    norm = torch.norm((walsh_opt - target).float(), p=2, dim=1)
+    norm = norm.reshape(batch_size, field_size)
+    return norm, F_translate.reshape(batch_size, field_size, field_size)
+
+def gradient_descent(F, T, trace_table, max_stuck=1000):
+    prev_res = torch.tensor([float('inf')]*F.size(0), device=T.device)
+    count_stuck = 0
+    while True:
+        grad, F_translate = gradient_walsh(F, T, trace_table)
+
+        best_values, best_dir = torch.min(grad, dim=1)
+        
+        improvement_idx = best_values < prev_res
+        F[improvement_idx] = F_translate[improvement_idx, best_dir[improvement_idx], :]
+        prev_res = torch.minimum(best_values, prev_res)
+        if not torch.any(improvement_idx):
+            count_stuck += 1
+        else:
+            count_stuck = 0
+        if count_stuck > max_stuck:
+            break
+    return F
 
 def compute_delta_table(DF):
     """
@@ -786,3 +887,69 @@ def compute_degrees(P, exponent):
     # Compute the maximum popcount for each row.
     degrees = popcounts_valid.max(dim=1).values
     return degrees
+
+def local_search_delta_mean(P, X, T, max_steps=32, batch_perturbation=2_000):
+    F = evaluate_polynomials(P, X, T)
+    DF = compute_derivative(F, T)
+    
+    _, delta_mean, _ = compute_delta_spectra(DF)
+    delta_mean_temp = delta_mean[0]
+    acc = 0
+    while True:
+        k = random.randint(0, 63)
+        P_eps = torch.randint(0, 2, (batch_perturbation, 64), device=T.device)
+        P_new_eps = torch.where(P_eps==1, k, 63)
+
+        F_eps = evaluate_polynomials(P_new_eps, X, T)
+        F_perturbate = add(F, F_eps, T)
+
+        DF = compute_derivative(F_perturbate, T)
+        _, delta_mean, _ = compute_delta_spectra(DF)
+        idx_delta_mean = torch.argmin(delta_mean)
+        if delta_mean[idx_delta_mean] < delta_mean_temp:
+            delta_mean_temp = delta_mean[idx_delta_mean]
+            F = F_perturbate[idx_delta_mean,:].unsqueeze(0)
+            acc = 0
+        else:
+            acc += 1
+        
+        if acc > max_steps:
+            return F, delta_mean_temp
+
+def step_fun(acc, max_steps):
+    if acc < int(max_steps*0.8):
+        return 1
+    dist = int(32*(acc-max_steps*0.8)/(0.2*max_steps))
+    return dist
+
+def local_search_spectrum(P, X, T, max_steps=20, batch_perturbation=1_000):
+    target = torch.zeros(T.size(0), device=P.device)
+    target[-1] = 2016
+    target[-2] = 2016
+
+    F = evaluate_polynomials(P, X, T)
+    DF = compute_derivative(F, T)
+    delta_table = compute_delta_table(DF).reshape(1, 63, 64)
+    twisted_delta = compute_delta_twisted_table(delta_table)
+    distance_old = (torch.sqrt((twisted_delta - target)**2)).sum(dim=1)[0]
+    acc = 0
+    while True:
+        k = step_fun(acc, max_steps)
+        F_new_eps = draw_sparse_polynomials(64, k, batch_perturbation, device=T.device)
+        F_perturbate = add(F, F_new_eps, T)
+            
+        DF = compute_derivative(F_perturbate, T)
+        
+        delta_table = compute_delta_table(DF).reshape(F_perturbate.size(0), 63, 64)
+        twisted_delta = compute_delta_twisted_table(delta_table)
+        distances = (torch.sqrt((twisted_delta - target)**2)).sum(dim=1)
+        indice = torch.argmin(distances)
+        if distances[indice] < distance_old:
+            F = F_perturbate[indice,:].unsqueeze(0)
+            distance_old = distances[indice]
+            acc = 0
+        else:
+            acc += 1
+        
+        if acc > max_steps:
+            return F, distance_old

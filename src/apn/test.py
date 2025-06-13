@@ -132,8 +132,20 @@ def _test_generate_linear_polynomial(device='cpu'):
 
         assert torch.all(delta_prime==delta_test), "generated polynomials do not preserve delta values"
 
+def _test_walsh_optimal(device='cpu'):
+    trace_table = compute_trace_table(6)
+    T = add_table(6)
+    with open(f"tables/cube_table_6", "r") as fp:
+        F = json.load(fp)
+    F = torch.tensor([F], device=device)
+    DF = compute_derivative(F, T)
+    output = compute_walsh_optimal(DF, trace_table)
+    assert torch.all(output==2**(6*2+1) * torch.ones(F.shape[0])), "Issue with Walsh optimal"
 
 if __name__ == "__main__":
+    _test_walsh_optimal()
+    print("PASS walsh_optimal")
+
     _test_evaluate_all_matrix()
     print("PASS evaluate_all_matrix")
 
