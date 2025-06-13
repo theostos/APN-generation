@@ -107,7 +107,7 @@ def split_bitensor(t0, t1, size):
 
 def create_eval_datasets(input_file):
     # preprocessing of the input text file
-    data_P, data_F = torch.load(input_file, weights_only=True)
+    data_P, data_F = torch.load(input_file, weights_only=False, map_location='cpu')
     data_P = data_P.to('cpu')
     data_F = data_F.to('cpu')
     batch_size = data_P.size(0)
@@ -123,7 +123,7 @@ def create_eval_datasets(input_file):
 
 def create_datasets(input_file):
     # preprocessing of the input text file
-    data = torch.load(input_file, weights_only=True)
+    data = torch.load(input_file, weights_only=False, map_location='cpu')
     data = data.to('cpu')
     batch_size = data.size(0)
 

@@ -25,9 +25,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import torch.multiprocessing as mp
 
-from model import generate, ModelConfig, Transformer
-from dataset import create_datasets, InfiniteDataLoader, create_eval_datasets
-from apn import improve_beam_score_functions, score_functions, evaluate_polynomials, check_if_permutation, compute_degrees
+from src.training.model import generate, ModelConfig, Transformer
+from src.training.dataset import create_datasets, InfiniteDataLoader, create_eval_datasets
+from src.apn.apn import score_functions, evaluate_polynomials, check_if_permutation, compute_degrees, compute_delta_twisted_table, compute_delta_table, compute_derivative
 
 def evaluate_delta(model, X, T, device, batch_size=8192):
     field_size = T.size(0)
@@ -50,6 +50,13 @@ def evaluate_delta(model, X, T, device, batch_size=8192):
     
     delta_max = deltas_max.max()
     delta_min = deltas_max.min()
+    target = torch.zeros(T.size(0), device=P.device)
+    target[-1] = 2016
+    target[-2] = 2016
+    DF = compute_derivative(F, T)
+    delta_table = compute_delta_table(DF).reshape(batch_size, 63, 64)
+    twisted_delta = compute_delta_twisted_table(delta_table)
+    distance_target = (torch.sqrt((twisted_delta - target)**2)).sum(dim=1)[0]
 
     idx_sol = (deltas_max == 2)
     P = P[idx_sol,:]
@@ -70,36 +77,36 @@ def evaluate_delta(model, X, T, device, batch_size=8192):
     #                 print()
     #         mean_deg_list.append(deg)
     model.train()
-    return deltas_max.float().mean(), deltas_mean.float().mean(), deltas_mean.float().min(), delta_max, delta_min, torch.tensor([is_perm.sum()/batch_size*100]), degrees.float().mean()
+    return deltas_max.float().mean(), deltas_mean.float().mean(), deltas_mean.float().min(), delta_max, delta_min, torch.tensor([is_perm.sum()/batch_size*100]), degrees.float().mean(), distance_target.float().mean()
     
 
-def print_samples(num=10):
-    """ samples from the model and pretty prints the decoded samples """
-    X_init = torch.zeros(num, 1, dtype=torch.long).to(args.device)
-    top_k = args.top_k if args.top_k != -1 else None
-    steps = train_dataset.get_output_length() - 1 # -1 because we already start with <START> token (index 0)
-    X_samp = generate(model, X_init, steps, top_k=top_k, do_sample=True).to('cpu')
-    train_samples, test_samples, new_samples = [], [], []
-    for i in range(X_samp.size(0)):
-        # get the i'th row of sampled integers, as python list
-        row = X_samp[i, 1:].tolist() # note: we need to crop out the first <START> token
-        # token 0 is the <STOP> token, so we crop the output sequence at that point
-        crop_index = row.index(0) if 0 in row else len(row)
-        row = row[:crop_index]
-        word_samp = train_dataset.decode(row)
-        # separately track samples that we have and have not seen before
-        if train_dataset.contains(word_samp):
-            train_samples.append(word_samp)
-        elif test_dataset.contains(word_samp):
-            test_samples.append(word_samp)
-        else:
-            new_samples.append(word_samp)
-    print('-'*80)
-    for lst, desc in [(train_samples, 'in train'), (test_samples, 'in test'), (new_samples, 'new')]:
-        print(f"{len(lst)} samples that are {desc}:")
-        for word in lst:
-            print(word)
-    print('-'*80)
+# def print_samples(num=10):
+#     """ samples from the model and pretty prints the decoded samples """
+#     X_init = torch.zeros(num, 1, dtype=torch.long).to(args.device)
+#     top_k = args.top_k if args.top_k != -1 else None
+#     steps = train_dataset.get_output_length() - 1 # -1 because we already start with <START> token (index 0)
+#     X_samp = generate(model, X_init, steps, top_k=top_k, do_sample=True).to('cpu')
+#     train_samples, test_samples, new_samples = [], [], []
+#     for i in range(X_samp.size(0)):
+#         # get the i'th row of sampled integers, as python list
+#         row = X_samp[i, 1:].tolist() # note: we need to crop out the first <START> token
+#         # token 0 is the <STOP> token, so we crop the output sequence at that point
+#         crop_index = row.index(0) if 0 in row else len(row)
+#         row = row[:crop_index]
+#         word_samp = train_dataset.decode(row)
+#         # separately track samples that we have and have not seen before
+#         if train_dataset.contains(word_samp):
+#             train_samples.append(word_samp)
+#         elif test_dataset.contains(word_samp):
+#             test_samples.append(word_samp)
+#         else:
+#             new_samples.append(word_samp)
+#     print('-'*80)
+#     for lst, desc in [(train_samples, 'in train'), (test_samples, 'in test'), (new_samples, 'new')]:
+#         print(f"{len(lst)} samples that are {desc}:")
+#         for word in lst:
+#             print(word)
+#     print('-'*80)
 
 @torch.inference_mode()
 def evaluate(model, rank, dataset, batch_size=50, max_batches=None):
@@ -137,7 +144,7 @@ def main(rank: int, world_size: int):
     parser.add_argument('--work-dir', '-o', type=str, default='out', help="output working directory")
     parser.add_argument('--resume', action='store_true', help="when this flag is used, we will resume optimization from existing model in the workdir")
     parser.add_argument('--sample-only', action='store_true', help="just sample from the model and quit, don't train")
-    parser.add_argument('--num-workers', '-n', type=int, default=4, help="number of data workers for both train/test")
+    parser.add_argument('--num-workers', '-n', type=int, default=1, help="number of data workers for both train/test")
     parser.add_argument('--max-steps', type=int, default=-1, help="max number of optimization steps to run for, or -1 for infinite.")
     parser.add_argument('--device', type=str, default='cuda:0', help="device to use for compute, examples: cpu|cuda|cuda:2|mps")
     parser.add_argument('--seed', type=int, default=3407, help="seed")
@@ -186,14 +193,15 @@ def main(rank: int, world_size: int):
     eval_train = False
     delta_train = True
 
-    with open(f"add_table_6", "r") as fp:
+    with open(f"tables/add_table_6", "r") as fp:
         T = json.load(fp)
     T = torch.tensor(T, device=rank)
 
-    with open(f"power_table_6", "r") as fp:
+    with open(f"tables/power_table_6", "r") as fp:
         X_pow = json.load(fp)
     X_pow = torch.tensor(X_pow, device=rank)
     assert eval_train or delta_train, "need at least one criterium of training"
+    
     while True:
         t0 = time.time()
 
@@ -234,8 +242,8 @@ def main(rank: int, world_size: int):
 
         # evaluate the model
         if step % 20 == 0 and rank == 0:
-            deltas_max, deltas_mean, delta_mean_min, delta_max, delta_min, proba_perm, mean_deg  = evaluate_delta(model_base, X_pow, T, rank)
-            print(f"deltas max: {deltas_max.item():.4f}, deltas mean: {deltas_mean.item():.4f}, deltas mean_min: {delta_mean_min.item():.4f}, max: {delta_max.item():.4f}, min: {delta_min.item():.4f}, proba permutation: {proba_perm.item():.4f}, mean deg: {mean_deg.item():.4f}")
+            deltas_max, deltas_mean, delta_mean_min, delta_max, delta_min, proba_perm, mean_deg, distance_spectra  = evaluate_delta(model_base, X_pow, T, rank)
+            print(f"Distance spectra: {distance_spectra.item():.4f}, deltas max: {deltas_max.item():.4f}, deltas mean: {deltas_mean.item():.4f}, deltas mean_min: {delta_mean_min.item():.4f}, max: {delta_max.item():.4f}, min: {delta_min.item():.4f}, proba permutation: {proba_perm.item():.4f}, mean deg: {mean_deg.item():.4f}")
             writer.add_scalar("Eval/Deltas", deltas_max.item(), step)
             writer.add_scalar("Eval/Deltas mean", deltas_mean.item(), step)
             writer.add_scalar("Eval/Deltas mean min", delta_mean_min.item(), step)
@@ -245,6 +253,8 @@ def main(rank: int, world_size: int):
             writer.add_scalar("Eval/Proba permutation", proba_perm.item(), step)
             writer.add_scalar("Eval/Proba apn", proba_perm.item(), step)
             writer.add_scalar("Eval/Mean deg", mean_deg.item(), step)
+
+            writer.add_scalar("Eval/Distance target spectra", distance_spectra.item(), step)
             # writer.add_scalar("Loss/test", test_loss, step)
             writer.flush()
         if step % 1100 == 1000 and rank == 0:
@@ -260,4 +270,4 @@ if __name__ == '__main__':
     device=0
     world_size = torch.cuda.device_count()
     mp.spawn(main, args=(world_size, ), nprocs=world_size)
-    main(device)
+    main(device, world_size)

@@ -22,9 +22,9 @@ import torch
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from model import generate, ModelConfig, Transformer
-from dataset import create_datasets, InfiniteDataLoader, create_eval_datasets
-from apn import improve_beam_score_functions
+from src.training.model import generate, ModelConfig, Transformer
+from src.training.dataset import create_datasets, InfiniteDataLoader, create_eval_datasets
+from src.apn.apn import improve_beam_score_functions
 
 def evaluate_delta(model, T, device):
     field_size = T.size(0)
