@@ -19,7 +19,7 @@ def make(batch_size, device):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--num-device', default=0, type=int)
+    parser.add_argument('--num-device', default=1, type=int)
     parser.add_argument('--batch-size', default=10, type=int)
 
     args = parser.parse_args()
@@ -27,9 +27,10 @@ if __name__ == "__main__":
     list_P = []
     count = 0
     to_do = [f'cuda:{k}' for k in range(args.num_device)]
+    make(10, 'cuda:0')
     with concurrent.futures.ProcessPoolExecutor(max_workers=args.num_device) as executor:
         futures = []
-        for device in enumerate(to_do):
+        for device in to_do:
             futures.append(executor.submit(make, args.batch_size, device))
         for _ in tqdm(concurrent.futures.as_completed(futures), desc="Overall progress", position=0, total=len(futures)):
             pass
