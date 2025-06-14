@@ -30,6 +30,6 @@ if __name__ == "__main__":
     with concurrent.futures.ProcessPoolExecutor(max_workers=args.num_device) as executor:
         futures = []
         for device in enumerate(to_do):
-            futures.append(executor.submit(make, device, args.batch_size))
+            futures.append(executor.submit(make, args.batch_size, device))
         for _ in tqdm(concurrent.futures.as_completed(futures), desc="Overall progress", position=0, total=len(futures)):
             pass
