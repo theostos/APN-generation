@@ -6,8 +6,8 @@ from tqdm import tqdm
 from src.apn.apn import *
 
 def make(batch_size, device):
-    T = add_table(6, device=args.device)
-    trace_table = compute_trace_table(6, device=args.device)
+    T = add_table(6, device=device)
+    trace_table = compute_trace_table(6, device=device)
     while True:
         F = torch.randint(0, 64, (batch_size, 64), device=device)
         gradient_descent(F, T, trace_table)
