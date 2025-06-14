@@ -8,6 +8,7 @@ from src.apn.apn import *
 def make(batch_size, device):
     T = add_table(6, device=device)
     trace_table = compute_trace_table(6, device=device)
+    list_P = []
     while True:
         F = torch.randint(0, 64, (batch_size, 64), device=device)
         gradient_descent(F, T, trace_table)
@@ -23,11 +24,8 @@ if __name__ == "__main__":
     parser.add_argument('--batch-size', default=10, type=int)
 
     args = parser.parse_args()
-
-    list_P = []
     count = 0
     to_do = [f'cuda:{k}' for k in range(args.num_device)]
-    make(10, 'cuda:0')
     with concurrent.futures.ProcessPoolExecutor(max_workers=args.num_device) as executor:
         futures = []
         for device in to_do:
