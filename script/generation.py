@@ -6,6 +6,8 @@ from tqdm import tqdm
 from src.apn.apn import *
 
 def make(batch_size, device):
+    T = add_table(6, device=args.device)
+    trace_table = compute_trace_table(6, device=args.device)
     while True:
         F = torch.randint(0, 64, (batch_size, 64), device=device)
         gradient_descent(F, T, trace_table)
@@ -21,9 +23,6 @@ if __name__ == "__main__":
     parser.add_argument('--batch-size', default=10, type=int)
 
     args = parser.parse_args()
-
-    T = add_table(6, device=args.device)
-    trace_table = compute_trace_table(6, device=args.device)
 
     list_P = []
     count = 0
