@@ -27,7 +27,7 @@ if __name__ == "__main__":
     list_P = []
     count = 0
     to_do = [f'cuda:{k}' for k in range(args.num_device)]
-    with concurrent.futures.ProcessPoolExecutor(max_workers=args.max_workers) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=args.num_device) as executor:
         futures = []
         for device in enumerate(to_do):
             futures.append(executor.submit(make, device, args.batch_size))
